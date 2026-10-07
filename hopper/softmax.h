@@ -124,17 +124,12 @@ struct Softmax {
     };
 
     // infrope fork: same as max_get_scale / online_softmax, but row mi of this tile is taken as (score - off(mi)) for
-    // every element without touching the elements (sink-scale fast path): the tile max is lowered by off and the exp
-    // subtracts (row_max + off).
-    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename TensorOff>
-    __forceinline__ __device__ TensorT max_get_scale_off(Tensor0 &acc_s, TensorOff const &off) {
-        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-        static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
+    // every element without touching the elements (sink-scale fast path): the tile max comes from SinkScale::apply
+    // (already lowered by off for fully shifted rows) and the exp subtracts (row_max + off).
+    template<bool Is_first, bool Check_inf=false, typename TensorMax>
+    __forceinline__ __device__ TensorT max_get_scale_off(TensorMax const &tmax) {
+        // tmax: this tile's row max of the (offset-adjusted) scores, already reduced across the quad (SinkScale::apply)
         TensorT scores_scale;
-        TensorT tmax;
-        flash::template reduce_max</*zero_init=*/true>(scores, tmax);
-        #pragma unroll
-        for (int mi = 0; mi < size(tmax); ++mi) { tmax(mi) -= off(mi); }
         if constexpr (Is_first) {
             cute::copy(tmax, row_max);
             cute::fill(scores_scale, 1.f);

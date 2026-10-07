@@ -6,7 +6,8 @@
  * Fast path: if the whole row of a tile sits below the ramp (tile max < b - tau/2), every element would get exactly
  * -delta, so nothing is touched and the shift is returned as a per-row offset that the online softmax folds into its
  * row max (softmax.h, *_off variants).  Only tiles holding a score above that bound pay the elementwise gate; with a
- * sink threshold these are a few per row.
+ * sink threshold these are a few per row.  apply() runs after the mask (-inf entries pass through the gate unchanged)
+ * and also returns the tile's row max of the modified scores, so the softmax does not reduce the tile a second time.
  ******************************************************************************/
 
 #pragma once
@@ -40,7 +41,7 @@ struct SinkScale {
 
     template <typename Engine, typename Layout, typename TensorOff>
     CUTLASS_DEVICE
-    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, TensorOff &off) const {
+    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, TensorOff &off, TensorOff &tmax_mod) const {
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
         Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
@@ -64,11 +65,14 @@ struct SinkScale {
                 if (row < seqlen_q) { b = pb[h * head_stride + row]; d = pd[h * head_stride + row]; }
             }
             float o = 0.f;
+            float mm = tmax(m);                                                // row max of the modified tile (thread-local)
             if (d != 0.f) {
                 float const lo = tau_inv > 0.f ? b - 0.5f / tau_inv : b;       // below lo the ramp is fully on
                 if (tmax(m) < lo) {
                     o = d;                                                     // whole row-tile shifted: fold into the max
+                    mm = tmax(m) - d;
                 } else {
+                    mm = -INFINITY;
                     #pragma unroll
                     for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                         float s = tSrS_rowcol(m, n);
@@ -80,11 +84,15 @@ struct SinkScale {
                             s -= d;
                         }
                         tSrS_rowcol(m, n) = s;
+                        mm = fmaxf(mm, s);
                     }
                 }
             }
             off(m) = o;
+            tmax_mod(m) = mm;
         }
+        // mixed rows reduced their modified max thread-locally; one uniform quad reduction makes every row's max exact
+        quad_allreduce_(tmax_mod, tmax_mod, max_op);
     }
 };
 

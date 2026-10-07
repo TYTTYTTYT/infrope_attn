@@ -1092,10 +1092,9 @@ struct CollectiveMainloopFwdSm90 {
             !Has_sinkscale ? nullptr : params.ptr_sink_b + sink_off,
             !Has_sinkscale ? nullptr : params.ptr_sink_delta + sink_off,
             params.sink_head_stride, params.qhead_per_khead_divmod, params.sink_tau_inv);
-        typename Softmax::TensorT sink_rowoff;                      // per-row shift folded into the softmax max (fast path)
+        typename Softmax::TensorT sink_rowoff, sink_tmax;           // per-row shift folded into the softmax max, tile row max
         auto scoremod_premask_fn = [&](auto& tSrS) {
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
-            if constexpr (Has_sinkscale) { sinkscale.apply(tSrS, m_block, sink_rowoff); }
         };
 
         auto write_P_to_smem = [&](auto& tOrP) {
@@ -1173,7 +1172,8 @@ struct CollectiveMainloopFwdSm90 {
 
             typename Softmax::TensorT scores_scale;
             if constexpr (Has_sinkscale) {
-                cute::copy(softmax.template max_get_scale_off</*Is_first=*/true, /*Check_inf=*/true>(tSrS, sink_rowoff), scores_scale);
+                sinkscale.apply(tSrS, m_block, sink_rowoff, sink_tmax);
+                cute::copy(softmax.template max_get_scale_off</*Is_first=*/true, /*Check_inf=*/true>(sink_tmax), scores_scale);
             } else {
                 cute::copy(softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS), scores_scale);
             }
@@ -1223,7 +1223,8 @@ struct CollectiveMainloopFwdSm90 {
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
                 if constexpr (Has_sinkscale) {
-                    cute::copy(softmax.template max_get_scale_off</*Is_first=*/false, Check_inf>(tSrS, sink_rowoff), scores_scale);
+                    sinkscale.apply(tSrS, m_block, sink_rowoff, sink_tmax);
+                    cute::copy(softmax.template max_get_scale_off</*Is_first=*/false, Check_inf>(sink_tmax), scores_scale);
                 } else {
                     cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 }
@@ -1321,7 +1322,8 @@ struct CollectiveMainloopFwdSm90 {
                 mask_fn(tSrS, n_block);
                 typename Softmax::TensorT scores_scale;
                 if constexpr (Has_sinkscale) {
-                    cute::copy(softmax.template max_get_scale_off</*Is_first=*/Is_first_iter, Check_inf>(tSrS, sink_rowoff), scores_scale);
+                    sinkscale.apply(tSrS, m_block, sink_rowoff, sink_tmax);
+                    cute::copy(softmax.template max_get_scale_off</*Is_first=*/Is_first_iter, Check_inf>(sink_tmax), scores_scale);
                 } else {
                     cute::copy(softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS), scores_scale);
                 }
