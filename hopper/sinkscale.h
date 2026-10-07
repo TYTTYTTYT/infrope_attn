@@ -7,7 +7,9 @@
  * -delta, so nothing is touched and the shift is returned as a per-row offset that the online softmax folds into its
  * row max (softmax.h, *_off variants).  Only tiles holding a score above that bound pay the elementwise gate; with a
  * sink threshold these are a few per row.  apply() runs after the mask (-inf entries pass through the gate unchanged)
- * and also returns the tile's row max of the modified scores, so the softmax does not reduce the tile a second time.
+ * and returns the tile's row max of the modified scores: the transform s -> s - delta * g(s) is monotone
+ * non-decreasing, so that max is the transform of the raw tile max and no second reduction is needed.  The per-row
+ * parameters are loaded once per query tile (prepare), not per key tile.
  ******************************************************************************/
 
 #pragma once
@@ -17,13 +19,16 @@
 #include "cutlass/fast_math.h"
 
 #include "utils.h"
+#include "softmax.h"
 
 namespace flash {
 
 using namespace cute;
 
-template <int kBlockM, int kBlockN, typename TiledMma, bool PackGQA>
+template <int kBlockM, int kBlockN, typename TiledMma, bool PackGQA, int kNRows>
 struct SinkScale {
+
+    using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
 
     int const thread_idx;
     int const seqlen_q;
@@ -32,6 +37,7 @@ struct SinkScale {
     int64_t const head_stride;
     cutlass::FastDivmod const qhead_per_khead_divmod;
     float const tau_inv;
+    TensorT row_b, row_d, row_lo;   // this thread's rows (prepare)
 
     CUTLASS_DEVICE
     SinkScale(const int thread_idx, const int seqlen_q, float const* pb, float const* pd, int64_t head_stride,
@@ -39,22 +45,16 @@ struct SinkScale {
         : thread_idx(thread_idx), seqlen_q(seqlen_q), pb(pb), pd(pd), head_stride(head_stride),
           qhead_per_khead_divmod(qhead_per_khead_divmod), tau_inv(tau_inv) {};
 
-    template <typename Engine, typename Layout, typename TensorOff>
+    // Per-row b, delta and the bound below which the ramp is fully on, for the rows of query tile m_block.
     CUTLASS_DEVICE
-    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, TensorOff &off, TensorOff &tmax_mod) const {
-        static_assert(Layout::rank == 3, "Only support 3D Tensor");
+    void prepare(const int m_block) {
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
         Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tScS = thread_mma.partition_C(cS);
-        Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
         Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
-        CUTE_STATIC_ASSERT_V(size<0>(tSrS_rowcol) == size(off));
-        // row max of this tile (the 4 threads of a row together), on the raw scores
-        Tensor tmax = make_fragment_like(off);
-        MaxOp<float> max_op;
-        flash::reduce_<true>(tSrS_rowcol, tmax, max_op);
+        CUTE_STATIC_ASSERT_V(size<0>(tScS_rowcol) == Int<kNRows>{});
         #pragma unroll
-        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+        for (int m = 0; m < kNRows; ++m) {
             int const prow = int(get<0>(tScS_rowcol(m, _0{}))) + m_block * kBlockM;
             float b = 0.f, d = 0.f;
             if constexpr (!PackGQA) {
@@ -64,35 +64,49 @@ struct SinkScale {
                 qhead_per_khead_divmod(row, h, prow);
                 if (row < seqlen_q) { b = pb[h * head_stride + row]; d = pd[h * head_stride + row]; }
             }
-            float o = 0.f;
-            float mm = tmax(m);                                                // row max of the modified tile (thread-local)
+            row_b(m) = b;
+            row_d(m) = d;
+            row_lo(m) = tau_inv > 0.f ? b - 0.5f / tau_inv : b;
+        }
+    }
+
+    // s -> s - d * g(s): the ramp gate, monotone non-decreasing in s
+    CUTLASS_DEVICE
+    float shift(float s, float b, float d) const {
+        if (tau_inv > 0.f) {
+            float g = fmaf(b - s, tau_inv, 0.5f);
+            g = fminf(fmaxf(g, 0.f), 1.f);
+            return fmaf(-d, g, s);
+        }
+        return s < b ? s - d : s;
+    }
+
+    template <typename Engine, typename Layout>
+    CUTLASS_DEVICE
+    void apply(Tensor<Engine, Layout> &tSrS, TensorT &off, TensorT &tmax_mod) const {
+        static_assert(Layout::rank == 3, "Only support 3D Tensor");
+        Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
+        CUTE_STATIC_ASSERT_V(size<0>(tSrS_rowcol) == Int<kNRows>{});
+        TensorT tmax;                                                        // raw row max of this tile (quad-reduced)
+        MaxOp<float> max_op;
+        flash::reduce_<true>(tSrS_rowcol, tmax, max_op);
+        #pragma unroll
+        for (int m = 0; m < kNRows; ++m) {
+            float const b = row_b(m), d = row_d(m);
+            float o = 0.f, mm = tmax(m);
             if (d != 0.f) {
-                float const lo = tau_inv > 0.f ? b - 0.5f / tau_inv : b;       // below lo the ramp is fully on
-                if (tmax(m) < lo) {
-                    o = d;                                                     // whole row-tile shifted: fold into the max
+                if (tmax(m) < row_lo(m)) {
+                    o = d;                                                   // whole row-tile shifted: fold into the max
                     mm = tmax(m) - d;
                 } else {
-                    mm = -INFINITY;
                     #pragma unroll
-                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                        float s = tSrS_rowcol(m, n);
-                        if (tau_inv > 0.f) {
-                            float g = fmaf(b - s, tau_inv, 0.5f);
-                            g = fminf(fmaxf(g, 0.f), 1.f);
-                            s = fmaf(-d, g, s);
-                        } else if (s < b) {
-                            s -= d;
-                        }
-                        tSrS_rowcol(m, n) = s;
-                        mm = fmaxf(mm, s);
-                    }
+                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) { tSrS_rowcol(m, n) = shift(tSrS_rowcol(m, n), b, d); }
+                    mm = shift(tmax(m), b, d);                               // monotone: the max moves with the raw max
                 }
             }
             off(m) = o;
             tmax_mod(m) = mm;
         }
-        // mixed rows reduced their modified max thread-locally; one uniform quad reduction makes every row's max exact
-        quad_allreduce_(tmax_mod, tmax_mod, max_op);
     }
 };
 

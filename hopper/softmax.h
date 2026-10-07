@@ -92,6 +92,7 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 template <int kNRows, int Max_offset=0>
 struct Softmax {
 
+    static constexpr int kNRows_ = kNRows;
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
     float const softmax_scale_log2;
