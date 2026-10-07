@@ -1084,15 +1084,18 @@ struct CollectiveMainloopFwdSm90 {
         // Softcapping needs to happen before masking since if we apply after masking, softcapping
         // can turn -inf to e.g. -50.0, which can affect the attention softmax.
         // fs fork, sink-scale: per-row threshold / shift on the raw scores, applied in the same place as softcap.
-        int64_t const sink_off = !Has_sinkscale ? 0 : bidb * params.sink_batch_stride + bidh * params.sink_head_stride;
-        flash::SinkScale<kBlockM, kBlockN, TiledMmaQK> sinkscale(
+        // with PackGQA the block's rows pack the q heads of kv head bidh: pointers start at q head bidh * qhead_per_khead
+        int64_t const sink_head0 = !PackGQA ? bidh : bidh * params.qhead_per_khead_divmod.divisor;
+        int64_t const sink_off = !Has_sinkscale ? 0 : bidb * params.sink_batch_stride + sink_head0 * params.sink_head_stride;
+        flash::SinkScale<kBlockM, kBlockN, TiledMmaQK, PackGQA> sinkscale(
             thread_idx, seqlen_q,
             !Has_sinkscale ? nullptr : params.ptr_sink_b + sink_off,
             !Has_sinkscale ? nullptr : params.ptr_sink_delta + sink_off,
-            params.sink_tau_inv);
+            params.sink_head_stride, params.qhead_per_khead_divmod, params.sink_tau_inv);
+        typename Softmax::TensorT sink_rowoff;                      // per-row shift folded into the softmax max (fast path)
         auto scoremod_premask_fn = [&](auto& tSrS) {
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
-            if constexpr (Has_sinkscale) { sinkscale.apply(tSrS, m_block); }
+            if constexpr (Has_sinkscale) { sinkscale.apply(tSrS, m_block, sink_rowoff); }
         };
 
         auto write_P_to_smem = [&](auto& tOrP) {
@@ -1168,10 +1171,19 @@ struct CollectiveMainloopFwdSm90 {
             scoremod_premask_fn(tSrS);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
 
-            Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            typename Softmax::TensorT scores_scale;
+            if constexpr (Has_sinkscale) {
+                cute::copy(softmax.template max_get_scale_off</*Is_first=*/true, /*Check_inf=*/true>(tSrS, sink_rowoff), scores_scale);
+            } else {
+                cute::copy(softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS), scores_scale);
+            }
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
 
-            softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            if constexpr (Has_sinkscale) {
+                softmax.template online_softmax_off</*Is_first=*/true, /*Check_inf=*/true>(tSrS, sink_rowoff);
+            } else {
+                softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            }
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1210,9 +1222,17 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
-                cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
+                if constexpr (Has_sinkscale) {
+                    cute::copy(softmax.template max_get_scale_off</*Is_first=*/false, Check_inf>(tSrS, sink_rowoff), scores_scale);
+                } else {
+                    cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
+                }
                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
-                softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+                if constexpr (Has_sinkscale) {
+                    softmax.template online_softmax_off</*Is_first=*/false, Check_inf>(tSrS, sink_rowoff);
+                } else {
+                    softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+                }
                 if constexpr (!HasQv) {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
@@ -1299,9 +1319,18 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
-                Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                typename Softmax::TensorT scores_scale;
+                if constexpr (Has_sinkscale) {
+                    cute::copy(softmax.template max_get_scale_off</*Is_first=*/Is_first_iter, Check_inf>(tSrS, sink_rowoff), scores_scale);
+                } else {
+                    cute::copy(softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS), scores_scale);
+                }
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
-                softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                if constexpr (Has_sinkscale) {
+                    softmax.template online_softmax_off</*Is_first=*/Is_first_iter, Check_inf>(tSrS, sink_rowoff);
+                } else {
+                    softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                }
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);

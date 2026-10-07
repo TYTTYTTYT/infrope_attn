@@ -560,7 +560,9 @@ if not SKIP_CUDA_BUILD:
                         for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                         if not (packgqa and (paged or split))]
     sources_fwd_sm90 += ["instantiations/flash_fwd_hdim64_128_bf16_sm90.cu"] + ([] if DISABLE_PACKGQA else ["instantiations/flash_fwd_hdim64_128_bf16_packgqa_sm90.cu"])  # fs fork
-    sources_fwd_sm90 += ["instantiations/flash_fwd_hdim128_bf16_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_sinkscale_sm90.cu"]  # fs fork, sink-scale
+    sources_fwd_sm90 += ["instantiations/flash_fwd_hdim128_bf16_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_sinkscale_sm90.cu"]  # infrope fork, sink-scale
+    sources_fwd_sm90 += [] if DISABLE_PACKGQA else ["instantiations/flash_fwd_hdim128_bf16_sinkscale_packgqa_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_sinkscale_packgqa_sm90.cu"]
+    sources_fwd_sm90 += [] if DISABLE_SPLIT else ["instantiations/flash_fwd_hdim128_bf16_split_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_split_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_split_sm90.cu"]
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

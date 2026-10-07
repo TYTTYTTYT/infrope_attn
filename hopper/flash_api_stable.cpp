@@ -323,7 +323,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
         if (params.is_bf16) {
             // fs fork: sink-scale kernels exist for bf16, SM90, head dim 128 (and the 64 x 128 far kernel), no PackGQA / Split / paged
             if constexpr (Has_sinkscale) {
-                if constexpr (Arch == 90 && !PackGQA && !Split && !PagedKVNonTMA && !Has_softcap) {
+                if constexpr (Arch == 90 && !PagedKVNonTMA && !Has_softcap) {
                     if (params.d <= 64 && params.dv > 64 && params.dv <= 128) {
                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
                     }
@@ -331,7 +331,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
                     }
                 }
-                STD_TORCH_CHECK(false, "sink-scale: only bf16, SM90, head dim 128 or 64x128, no pack_gqa / split / paged KV / softcap");
+                STD_TORCH_CHECK(false, "sink-scale: only bf16, SM90, head dim 128 or 64x128, no paged KV / softcap");
             }
             // fs fork: slow-band-only far pass = 64-dim QK GEMM against 128-dim values
             if constexpr (Arch == 90) {
@@ -1264,7 +1264,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         auto sink_delta = sink_delta_.value();
         CHECK_DEVICE(sink_b); CHECK_DEVICE(sink_delta);
         STD_TORCH_CHECK(sink_b.scalar_type() == torch::headeronly::ScalarType::Float && sink_delta.scalar_type() == torch::headeronly::ScalarType::Float, "sink_b / sink_delta must be float32");
-        STD_TORCH_CHECK(!is_varlen_q && !params.pack_gqa && params.arch >= 90, "sink-scale: no varlen, no pack_gqa, SM90 only");
+        STD_TORCH_CHECK(!is_varlen_q && params.arch >= 90, "sink-scale: no varlen, SM90 only");
         CHECK_SHAPE(sink_b, batch_size, num_heads, seqlen_q);
         CHECK_SHAPE(sink_delta, batch_size, num_heads, seqlen_q);
         CHECK_CONTIGUOUS(sink_b); CHECK_CONTIGUOUS(sink_delta);

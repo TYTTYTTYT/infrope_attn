@@ -123,6 +123,47 @@ struct Softmax {
         return scores_scale;
     };
 
+    // infrope fork: same as max_get_scale / online_softmax, but row mi of this tile is taken as (score - off(mi)) for
+    // every element without touching the elements (sink-scale fast path): the tile max is lowered by off and the exp
+    // subtracts (row_max + off).
+    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename TensorOff>
+    __forceinline__ __device__ TensorT max_get_scale_off(Tensor0 &acc_s, TensorOff const &off) {
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
+        TensorT scores_scale;
+        TensorT tmax;
+        flash::template reduce_max</*zero_init=*/true>(scores, tmax);
+        #pragma unroll
+        for (int mi = 0; mi < size(tmax); ++mi) { tmax(mi) -= off(mi); }
+        if constexpr (Is_first) {
+            cute::copy(tmax, row_max);
+            cute::fill(scores_scale, 1.f);
+        } else {
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float const prev = row_max(mi);
+                row_max(mi) = max(prev, tmax(mi));
+                float scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                scores_scale(mi) = exp2f((prev - scores_max_cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale(mi);
+            }
+        }
+        return scores_scale;
+    };
+
+    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename TensorOff>
+    __forceinline__ __device__ void online_softmax_off(Tensor0 &acc_s, TensorOff const &off) {
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
+        TensorT m_off;
+        #pragma unroll
+        for (int mi = 0; mi < size(row_max); ++mi) { m_off(mi) = row_max(mi) + off(mi); }   // -inf stays -inf
+        flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Max_offset>(scores, m_off, softmax_scale_log2);
+        flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
+    };
+
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
