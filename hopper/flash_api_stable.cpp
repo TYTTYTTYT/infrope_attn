@@ -317,10 +317,28 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
-template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
+template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap, bool Has_sinkscale = false>
 void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
     if (!params.is_e4m3) {
         if (params.is_bf16) {
+            // fs fork: sink-scale kernels exist for bf16, SM90, head dim 128 (and the 64 x 128 far kernel), no PackGQA / Split / paged
+            if constexpr (Has_sinkscale) {
+                if constexpr (Arch == 90 && !PackGQA && !Split && !PagedKVNonTMA && !Has_softcap) {
+                    if (params.d <= 64 && params.dv > 64 && params.dv <= 128) {
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
+                    }
+                    if (params.d > 96 && params.d <= 128) {
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
+                    }
+                }
+                STD_TORCH_CHECK(false, "sink-scale: only bf16, SM90, head dim 128 or 64x128, no pack_gqa / split / paged KV / softcap");
+            }
+            // fs fork: slow-band-only far pass = 64-dim QK GEMM against 128-dim values
+            if constexpr (Arch == 90) {
+                if (params.d <= 64 && params.dv > 64 && params.dv <= 128) {
+                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                }
+            }
             #ifndef FLASHATTENTION_DISABLE_HDIM64
             if (params.d <= 64) {
                 #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
@@ -441,7 +459,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation
                     static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
-                        run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap>(params, stream);
+                        BOOL_SWITCH(params.sink_b_ptr != nullptr, Has_sinkscale, [&] {
+                            run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap, Has_sinkscale>(params, stream);
+                        });
                     });
                 });
             });
@@ -773,7 +793,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<Tensor> sink_b_,      // fs fork, sink-scale: (b, h, s_q) float32, raw-score units
+        std::optional<Tensor> sink_delta_,  // (b, h, s_q) float32
+        double sink_tau                     // soft width (raw units); <= 0: hard threshold
         ) {
 
     auto dprops = get_device_prop();
@@ -1230,6 +1253,27 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     #ifdef FLASHATTENTION_DISABLE_APPENDKV
     STD_TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
+
+    // fs fork, sink-scale
+    params.sink_b_ptr = nullptr;
+    params.sink_delta_ptr = nullptr;
+    params.sink_tau_inv = 0.f;
+    if (sink_b_.has_value()) {
+        STD_TORCH_CHECK(sink_delta_.has_value(), "sink_b needs sink_delta");
+        auto sink_b = sink_b_.value();
+        auto sink_delta = sink_delta_.value();
+        CHECK_DEVICE(sink_b); CHECK_DEVICE(sink_delta);
+        STD_TORCH_CHECK(sink_b.scalar_type() == torch::headeronly::ScalarType::Float && sink_delta.scalar_type() == torch::headeronly::ScalarType::Float, "sink_b / sink_delta must be float32");
+        STD_TORCH_CHECK(!is_varlen_q && !params.pack_gqa && params.arch >= 90, "sink-scale: no varlen, no pack_gqa, SM90 only");
+        CHECK_SHAPE(sink_b, batch_size, num_heads, seqlen_q);
+        CHECK_SHAPE(sink_delta, batch_size, num_heads, seqlen_q);
+        CHECK_CONTIGUOUS(sink_b); CHECK_CONTIGUOUS(sink_delta);
+        params.sink_b_ptr = static_cast<float*>(sink_b.data_ptr());
+        params.sink_delta_ptr = static_cast<float*>(sink_delta.data_ptr());
+        params.sink_batch_stride = sink_b.stride(0);
+        params.sink_head_stride = sink_b.stride(1);
+        params.sink_tau_inv = sink_tau > 0 ? float(1.0 / sink_tau) : 0.f;
+    }
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
@@ -1791,8 +1835,11 @@ void boxed_mha_fwd(
     auto num_splits = to<int64_t>(stack[31]);
     auto pack_gqa = to<std::optional<bool>>(stack[32]);
     auto sm_margin = to<int64_t>(stack[33]);
+    auto sink_b = to<std::optional<Tensor>>(stack[34]);
+    auto sink_delta = to<std::optional<Tensor>>(stack[35]);
+    auto sink_tau = to<double>(stack[36]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sink_b, sink_delta, sink_tau);
 
 
     stack[0] = from(out_);
@@ -1889,7 +1936,7 @@ void boxed_mha_fwd_get_scheduler_metadata(
     stack[0] = from(scheduler_metadata);
 }
 
-STABLE_TORCH_LIBRARY(flash_attn_3, m) {
+STABLE_TORCH_LIBRARY(flash_attn_fs, m) {
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -1924,7 +1971,10 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? sink_b = None,"
+        "Tensor? sink_delta = None,"
+        "float sink_tau = 0.0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1980,7 +2030,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "int sm_margin = 0) -> Tensor");
 }
 
-STABLE_TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
+STABLE_TORCH_LIBRARY_IMPL(flash_attn_fs, CUDA, m) {
     m.impl("fwd", &boxed_mha_fwd);
     m.impl("bwd", &boxed_mha_bwd);
     m.impl("fwd_combine", &boxed_mha_combine);

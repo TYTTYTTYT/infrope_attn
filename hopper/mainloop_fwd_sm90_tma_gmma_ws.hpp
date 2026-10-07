@@ -18,6 +18,7 @@
 #include "seqlen.h"
 #include "block.h"
 #include "mask.h"
+#include "sinkscale.h"
 #include "pack_gqa.h"
 #include "paged_kv.h"
 #include "rotary.h"
@@ -30,8 +31,9 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Has_sinkscale_ = false>
 struct CollectiveMainloopFwdSm90 {
+    static constexpr bool Has_sinkscale = Has_sinkscale_;   // fs fork: sink-scale score modifier compiled in
 
     static constexpr int kStages = Stages;
     using ClusterShape = ClusterShape_;
@@ -396,6 +398,10 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        float const* ptr_sink_b = nullptr;          // fs fork, sink-scale (see flash.h)
+        float const* ptr_sink_delta = nullptr;
+        int64_t sink_batch_stride = 0, sink_head_stride = 0;
+        float sink_tau_inv = 0.f;
     };
 
     // Device side kernel params
@@ -453,6 +459,10 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        float const* ptr_sink_b = nullptr;          // fs fork, sink-scale (see flash.h)
+        float const* ptr_sink_delta = nullptr;
+        int64_t sink_batch_stride = 0, sink_head_stride = 0;
+        float sink_tau_inv = 0.f;
     };
 
     static Params
@@ -564,7 +574,8 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_sink_b, args.ptr_sink_delta, args.sink_batch_stride, args.sink_head_stride, args.sink_tau_inv};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1072,8 +1083,16 @@ struct CollectiveMainloopFwdSm90 {
         }
         // Softcapping needs to happen before masking since if we apply after masking, softcapping
         // can turn -inf to e.g. -50.0, which can affect the attention softmax.
+        // fs fork, sink-scale: per-row threshold / shift on the raw scores, applied in the same place as softcap.
+        int64_t const sink_off = !Has_sinkscale ? 0 : bidb * params.sink_batch_stride + bidh * params.sink_head_stride;
+        flash::SinkScale<kBlockM, kBlockN, TiledMmaQK> sinkscale(
+            thread_idx, seqlen_q,
+            !Has_sinkscale ? nullptr : params.ptr_sink_b + sink_off,
+            !Has_sinkscale ? nullptr : params.ptr_sink_delta + sink_off,
+            params.sink_tau_inv);
         auto scoremod_premask_fn = [&](auto& tSrS) {
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+            if constexpr (Has_sinkscale) { sinkscale.apply(tSrS, m_block); }
         };
 
         auto write_P_to_smem = [&](auto& tOrP) {

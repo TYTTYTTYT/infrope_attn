@@ -15,7 +15,9 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};
             // With this workaround in Cutlass 3.8, tile size 192 x 128 got slower for non-causal, idk why
             // https://github.com/NVIDIA/cutlass/blob/833f6990e031b48b4cd2fcf55e0849c51ef6bac2/include/cute/container/tuple.hpp#L131
-            if (headdim_v == 512) {
+            if (headdim_v == 128) {          // fs fork: 64-dim QK, 128-dim V. 128 x 128 measured best (128 x 192: 0.93x of it, 192 x 128: 0.56x)
+                return {128, 128, true, true};
+            } else if (headdim_v == 512) {
                 return {64, 64, false, false};
             } else if (headdim_v == 256) {
                 return {128, 96, true, false};

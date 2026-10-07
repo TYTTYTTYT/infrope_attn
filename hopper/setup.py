@@ -33,7 +33,7 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flash_attn_3"
+PACKAGE_NAME = "flash_attn_fs"
 
 BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
@@ -559,6 +559,8 @@ if not SKIP_CUDA_BUILD:
     sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                         for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                         if not (packgqa and (paged or split))]
+    sources_fwd_sm90 += ["instantiations/flash_fwd_hdim64_128_bf16_sm90.cu"] + ([] if DISABLE_PACKGQA else ["instantiations/flash_fwd_hdim64_128_bf16_packgqa_sm90.cu"])  # fs fork
+    sources_fwd_sm90 += ["instantiations/flash_fwd_hdim128_bf16_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_sinkscale_sm90.cu"]  # fs fork, sink-scale
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

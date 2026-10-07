@@ -71,6 +71,13 @@ struct Flash_fwd_params : public Qkv_params {
     float scale_softmax;
     float softcap;
 
+    // fs fork, sink-scale: per (batch, head, query row) threshold b and shift delta in raw-score units (q.k before the
+    // softmax scale); scores below b are shifted by -delta (softly, width 1/sink_tau_inv; hard when sink_tau_inv <= 0).
+    float * __restrict__ sink_b_ptr;
+    float * __restrict__ sink_delta_ptr;
+    index_t sink_batch_stride, sink_head_stride;
+    float sink_tau_inv;
+
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
@@ -215,7 +222,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool Has_sinkscale = false>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>

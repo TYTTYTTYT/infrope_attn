@@ -213,6 +213,10 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        float const* ptr_sink_b = nullptr;          // fs fork, sink-scale (see flash.h)
+        float const* ptr_sink_delta = nullptr;
+        int64_t sink_batch_stride = 0, sink_head_stride = 0;
+        float sink_tau_inv = 0.f;
     };
 
     // Device side kernel params
@@ -259,6 +263,10 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        float const* ptr_sink_b = nullptr;          // fs fork, sink-scale (see flash.h)
+        float const* ptr_sink_delta = nullptr;
+        int64_t sink_batch_stride = 0, sink_head_stride = 0;
+        float sink_tau_inv = 0.f;
     };
 
     static Params
@@ -301,7 +309,8 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_sink_b, args.ptr_sink_delta, args.sink_batch_stride, args.sink_head_stride, args.sink_tau_inv};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
