@@ -545,7 +545,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
         : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-    int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
+    int64_t const size_one_kv_head = static_cast<int64_t>(params.seqlen_k) * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
     // Always enable PackGQA for Split
     // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
@@ -796,7 +796,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         int64_t sm_margin,
         std::optional<Tensor> sink_b_,      // fs fork, sink-scale: (b, h, s_q) float32, raw-score units
         std::optional<Tensor> sink_delta_,  // (b, h, s_q) float32
-        double sink_tau                     // soft width (raw units); <= 0: hard threshold
+        double sink_tau,                    // soft width (raw units); <= 0: hard threshold
+        int64_t v_head_div                  // K heads per V head when K carries a key layout per query head
         ) {
 
     auto dprops = get_device_prop();
@@ -904,7 +905,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     if (!paged_KV) {
         if (!is_varlen_k) {
             CHECK_SHAPE(k, batch_size_k, seqlen_k, num_heads_k, head_size);
-            CHECK_SHAPE(v, batch_size_k, seqlen_k, num_heads_k, head_size_v);
+            CHECK_SHAPE(v, batch_size_k, seqlen_k, num_heads_k / v_head_div, head_size_v);
         } else {
             CHECK_SHAPE(k, total_k, num_heads_k, head_size);
             CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
@@ -1258,6 +1259,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     params.sink_b_ptr = nullptr;
     params.sink_delta_ptr = nullptr;
     params.sink_tau_inv = 0.f;
+    params.v_head_div = v_head_div;
     if (sink_b_.has_value()) {
         STD_TORCH_CHECK(sink_delta_.has_value(), "sink_b needs sink_delta");
         auto sink_b = sink_b_.value();
@@ -1838,8 +1840,9 @@ void boxed_mha_fwd(
     auto sink_b = to<std::optional<Tensor>>(stack[34]);
     auto sink_delta = to<std::optional<Tensor>>(stack[35]);
     auto sink_tau = to<double>(stack[36]);
+    auto v_head_div = to<int64_t>(stack[37]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sink_b, sink_delta, sink_tau);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sink_b, sink_delta, sink_tau, v_head_div);
 
 
     stack[0] = from(out_);
@@ -1936,7 +1939,7 @@ void boxed_mha_fwd_get_scheduler_metadata(
     stack[0] = from(scheduler_metadata);
 }
 
-STABLE_TORCH_LIBRARY(flash_attn_fs, m) {
+STABLE_TORCH_LIBRARY(lc_fa3, m) {
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -1974,7 +1977,8 @@ STABLE_TORCH_LIBRARY(flash_attn_fs, m) {
         "int sm_margin = 0,"
         "Tensor? sink_b = None,"
         "Tensor? sink_delta = None,"
-        "float sink_tau = 0.0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "float sink_tau = 0.0,"
+        "int v_head_div = 1) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -2030,7 +2034,7 @@ STABLE_TORCH_LIBRARY(flash_attn_fs, m) {
         "int sm_margin = 0) -> Tensor");
 }
 
-STABLE_TORCH_LIBRARY_IMPL(flash_attn_fs, CUDA, m) {
+STABLE_TORCH_LIBRARY_IMPL(lc_fa3, CUDA, m) {
     m.impl("fwd", &boxed_mha_fwd);
     m.impl("bwd", &boxed_mha_bwd);
     m.impl("fwd_combine", &boxed_mha_combine);

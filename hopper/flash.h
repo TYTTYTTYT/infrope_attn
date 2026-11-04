@@ -78,6 +78,9 @@ struct Flash_fwd_params : public Qkv_params {
     index_t sink_batch_stride, sink_head_stride;
     float sink_tau_inv;
 
+    // longctx: K carries one head per query head, V one per KV head (DPE far field): V head = query head / v_head_div
+    int v_head_div = 1;
+
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;

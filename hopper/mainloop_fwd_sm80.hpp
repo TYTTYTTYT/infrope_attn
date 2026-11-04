@@ -217,6 +217,7 @@ struct CollectiveMainloopFwdSm80 {
         float const* ptr_sink_delta = nullptr;
         int64_t sink_batch_stride = 0, sink_head_stride = 0;
         float sink_tau_inv = 0.f;
+        int v_head_div = 1;
     };
 
     // Device side kernel params
@@ -267,6 +268,7 @@ struct CollectiveMainloopFwdSm80 {
         float const* ptr_sink_delta = nullptr;
         int64_t sink_batch_stride = 0, sink_head_stride = 0;
         float sink_tau_inv = 0.f;
+        int v_head_div = 1;
     };
 
     static Params
@@ -310,7 +312,7 @@ struct CollectiveMainloopFwdSm80 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.ptr_sink_b, args.ptr_sink_delta, args.sink_batch_stride, args.sink_head_stride, args.sink_tau_inv};
+                args.ptr_sink_b, args.ptr_sink_delta, args.sink_batch_stride, args.sink_head_stride, args.sink_tau_inv, args.v_head_div};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>

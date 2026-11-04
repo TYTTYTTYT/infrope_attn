@@ -130,7 +130,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
         params.leftpad_k, params.seqlens_rotary,
-        params.sink_b_ptr, params.sink_delta_ptr, params.sink_batch_stride, params.sink_head_stride, params.sink_tau_inv
+        params.sink_b_ptr, params.sink_delta_ptr, params.sink_batch_stride, params.sink_head_stride, params.sink_tau_inv,
+        params.v_head_div
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),

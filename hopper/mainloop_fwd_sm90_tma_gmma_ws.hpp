@@ -402,6 +402,7 @@ struct CollectiveMainloopFwdSm90 {
         float const* ptr_sink_delta = nullptr;
         int64_t sink_batch_stride = 0, sink_head_stride = 0;
         float sink_tau_inv = 0.f;
+        int v_head_div = 1;
     };
 
     // Device side kernel params
@@ -463,6 +464,7 @@ struct CollectiveMainloopFwdSm90 {
         float const* ptr_sink_delta = nullptr;
         int64_t sink_batch_stride = 0, sink_head_stride = 0;
         float sink_tau_inv = 0.f;
+        int v_head_div = 1;
     };
 
     static Params
@@ -575,7 +577,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.ptr_sink_b, args.ptr_sink_delta, args.sink_batch_stride, args.sink_head_stride, args.sink_tau_inv};
+                args.ptr_sink_b, args.ptr_sink_delta, args.sink_batch_stride, args.sink_head_stride, args.sink_tau_inv, args.v_head_div};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -666,7 +668,7 @@ struct CollectiveMainloopFwdSm90 {
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
-        Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
+        Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv / params.v_head_div, _);
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
