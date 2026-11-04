@@ -1085,7 +1085,7 @@ struct CollectiveMainloopFwdSm90 {
         }
         // Softcapping needs to happen before masking since if we apply after masking, softcapping
         // can turn -inf to e.g. -50.0, which can affect the attention softmax.
-        // fs fork, sink-scale: per-row threshold / shift on the raw scores, applied in the same place as softcap.
+        // infrope fork, sink-scale: per-row threshold / shift on the raw scores, applied after the mask (sinkscale.h: -inf passes).
         // with PackGQA the block's rows pack the q heads of kv head bidh: pointers start at q head bidh * qhead_per_khead
         int64_t const sink_head0 = !PackGQA ? bidh : bidh * params.qhead_per_khead_divmod.divisor;
         int64_t const sink_off = !Has_sinkscale ? 0 : bidb * params.sink_batch_stride + sink_head0 * params.sink_head_stride;

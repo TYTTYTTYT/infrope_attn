@@ -319,22 +319,25 @@ void set_params_dgrad(Flash_bwd_params &params,
 
 template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap, bool Has_sinkscale = false>
 void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
+    if constexpr (Has_sinkscale) {
+        // infrope fork: sink-scale kernels exist for bf16 on SM90, head dim 128 and the 64 x 128 far kernel, with Split and PackGQA
+        // instantiations; none with paged KV or softcap.  Sink calls never reach the stock kernels below.
+        if constexpr (Arch == 90 && !PagedKVNonTMA && !Has_softcap) {
+            if (params.is_bf16 && !params.is_e4m3) {
+                if (params.d <= 64 && params.dv > 64 && params.dv <= 128) {
+                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
+                }
+                if (params.d > 96 && params.d <= 128) {
+                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
+                }
+            }
+        }
+        STD_TORCH_CHECK(false, "sink-scale: only bf16, SM90, head dim 128 or 64 x 128, no paged KV / softcap");
+    } else {
     if (!params.is_e4m3) {
         if (params.is_bf16) {
-            // fs fork: sink-scale kernels exist for bf16, SM90, head dim 128 (and the 64 x 128 far kernel), no PackGQA / Split / paged
-            if constexpr (Has_sinkscale) {
-                if constexpr (Arch == 90 && !PagedKVNonTMA && !Has_softcap) {
-                    if (params.d <= 64 && params.dv > 64 && params.dv <= 128) {
-                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
-                    }
-                    if (params.d > 96 && params.d <= 128) {
-                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
-                    }
-                }
-                STD_TORCH_CHECK(false, "sink-scale: only bf16, SM90, head dim 128 or 64x128, no paged KV / softcap");
-            }
-            // fs fork: slow-band-only far pass = 64-dim QK GEMM against 128-dim values
-            if constexpr (Arch == 90) {
+            // infrope fork: the far pass, a 64-dim QK GEMM against 128-dim values; instantiated without paged KV and softcap only
+            if constexpr (Arch == 90 && !PagedKVNonTMA && !Has_softcap) {
                 if (params.d <= 64 && params.dv > 64 && params.dv <= 128) {
                     return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                 }
@@ -445,6 +448,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
         STD_TORCH_CHECK(false, "This flash attention build does not support FP8.");
         #endif
     }
+    }  // infrope fork: end of the stock dispatch (Has_sinkscale == false)
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
@@ -902,6 +906,9 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         CHECK_SHAPE(q, total_q, num_heads, head_size);
         CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     }
+    // infrope fork: K carries one head per query head, V one per KV head (V head = K head / v_head_div); dense keys on SM90 only
+    STD_TORCH_CHECK(v_head_div >= 1 && num_heads_k % v_head_div == 0, "v_head_div must be at least 1 and divide the key heads");
+    STD_TORCH_CHECK(v_head_div == 1 || (!paged_KV && !is_varlen_k && !k_new_.has_value()), "v_head_div: dense keys only (no paged, varlen or appended KV)");
     if (!paged_KV) {
         if (!is_varlen_k) {
             CHECK_SHAPE(k, batch_size_k, seqlen_k, num_heads_k, head_size);
@@ -1255,13 +1262,16 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     STD_TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
 
-    // fs fork, sink-scale
+    // infrope fork, sink-scale.  sink_delta must be >= 0: the kernel takes the tile maximum of the modified scores as the transform of
+    // the raw maximum, which holds only while s - delta * g(s) does not decrease.  It is not checked here, that would need a device sync.
     params.sink_b_ptr = nullptr;
     params.sink_delta_ptr = nullptr;
     params.sink_tau_inv = 0.f;
     params.v_head_div = v_head_div;
+    STD_TORCH_CHECK(v_head_div == 1 || params.arch >= 90, "v_head_div: SM90 only");
     if (sink_b_.has_value()) {
         STD_TORCH_CHECK(sink_delta_.has_value(), "sink_b needs sink_delta");
+        STD_TORCH_CHECK(q_type == torch::headeronly::ScalarType::BFloat16, "sink-scale: bf16 only");
         auto sink_b = sink_b_.value();
         auto sink_delta = sink_delta_.value();
         CHECK_DEVICE(sink_b); CHECK_DEVICE(sink_delta);

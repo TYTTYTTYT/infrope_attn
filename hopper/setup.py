@@ -588,7 +588,8 @@ if not SKIP_CUDA_BUILD:
         flash_api_source = "flash_api_stable.cpp"
         stable_args = ["-DTORCH_TARGET_VERSION=0x0209000000000000"]  # Targets minimum runtime version torch 2.9.0
     else:
-        flash_api_source = "flash_api.cpp"
+        # infrope fork: our additions (sink-scale, v_head_div, the lc_fa3 library) live in flash_api_stable.cpp only
+        raise RuntimeError(f"this fork builds with torch >= 2.9 (the stable ABI, flash_api_stable.cpp); found torch {torch.__version__}")
 
     sources = (
         [flash_api_source]
