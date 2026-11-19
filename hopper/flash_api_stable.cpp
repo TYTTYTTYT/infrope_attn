@@ -825,7 +825,9 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<Tensor> sink_b_,      // fs fork, sink-scale: (b, h, s_q) float32, raw-score units
         std::optional<Tensor> sink_delta_,  // (b, h, s_q) float32
         double sink_tau,                    // soft width (raw units); <= 0: hard threshold
-        int64_t v_head_div                  // K heads per V head when K carries a key layout per query head
+        int64_t v_head_div,                 // K heads per V head when K carries a key layout per query head
+        bool no_combine                     // infrope fork: a split call leaves its splits unmerged (out_accum, softmax_lse_accum
+                                            // of the result); out and softmax_lse are then not written
         ) {
 
     auto dprops = get_device_prop();
@@ -1318,7 +1320,11 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
         cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
         run_mha_fwd(params, stream);
-        if (params.num_splits > 1) {
+        if (params.num_splits > 1 && no_combine) {
+            // infrope fork: the caller merges the splits itself, together with other passes (longctx: merge_parts).  The combine
+            // kernel is also what resets the scheduler's semaphore after a call with given scheduler_metadata: the caller's merge
+            // must then set the metadata's last word to 0 before the next call that uses it.
+        } else if (params.num_splits > 1) {
             if (out_type == torch::headeronly::ScalarType::BFloat16) {
                 // Since we want output in BF16. Otherwise fwd_combine will output to FP16
                 params.is_bf16 = true;
@@ -1876,8 +1882,9 @@ void boxed_mha_fwd(
     auto sink_delta = to<std::optional<Tensor>>(stack[35]);
     auto sink_tau = to<double>(stack[36]);
     auto v_head_div = to<int64_t>(stack[37]);
+    auto no_combine = to<bool>(stack[38]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sink_b, sink_delta, sink_tau, v_head_div);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sink_b, sink_delta, sink_tau, v_head_div, no_combine);
 
 
     stack[0] = from(out_);
@@ -2013,7 +2020,8 @@ STABLE_TORCH_LIBRARY(lc_fa3, m) {
         "Tensor? sink_b = None,"
         "Tensor? sink_delta = None,"
         "float sink_tau = 0.0,"
-        "int v_head_div = 1) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int v_head_div = 1,"
+        "bool no_combine = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
