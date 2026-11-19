@@ -69,6 +69,7 @@ DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
 DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
+DISABLE_DECODE_TILE = os.getenv("FLASH_ATTENTION_DISABLE_DECODE_TILE", "FALSE") == "TRUE"  # infrope fork
 DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
 
 # HACK: we monkey patch pytorch's _write_ninja_file to pass
@@ -519,6 +520,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
+        + (["-DFLASHATTENTION_DISABLE_DECODE_TILE"] if DISABLE_DECODE_TILE else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
     )
 
@@ -563,6 +565,9 @@ if not SKIP_CUDA_BUILD:
     sources_fwd_sm90 += ["instantiations/flash_fwd_hdim128_bf16_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_sinkscale_sm90.cu"]  # infrope fork, sink-scale
     sources_fwd_sm90 += [] if DISABLE_PACKGQA else ["instantiations/flash_fwd_hdim128_bf16_sinkscale_packgqa_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_sinkscale_packgqa_sm90.cu"]
     sources_fwd_sm90 += [] if DISABLE_SPLIT else ["instantiations/flash_fwd_hdim128_bf16_split_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_split_sinkscale_sm90.cu", "instantiations/flash_fwd_hdim64_128_bf16_split_sm90.cu"]
+    if not DISABLE_DECODE_TILE:  # infrope fork, decode tiles (64-row query tile): bf16, head dim 128 and 64 x 128
+        sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_bf16{var}_decodetile_sm90.cu" for hdim in ("128", "64_128")
+                             for var in [""] + ([] if DISABLE_PACKGQA else ["_packgqa"]) + ([] if DISABLE_SPLIT else ["_split"])]
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

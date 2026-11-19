@@ -80,6 +80,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // longctx: K carries one head per query head, V one per KV head (DPE far field): V head = query head / v_head_div
     int v_head_div = 1;
+    bool decode_tile = false;   // infrope fork: the kernels with a 64-row query tile (tile_size.h), chosen by get_decode_tile
 
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
@@ -225,7 +226,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool Has_sinkscale = false>
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool Has_sinkscale = false, bool Decode_tile = false>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>

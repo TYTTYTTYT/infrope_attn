@@ -9,7 +9,14 @@
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
-        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false) {
+        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false, bool decode_tile=false) {
+    if (decode_tile) {
+        // infrope fork, decode tiles: 64 query rows instead of the stock 128 or more, for calls whose query rows of one KV head fit
+        // in 64 (a decode step).  The key tile and the kernel's other choices stay the stock ones, so every row goes through the
+        // same arithmetic in the same order: the output is the stock kernel's bit for bit, with half the padding rows computed.
+        auto const stock = tile_size_fwd_sm90(headdim, headdim_v, is_causal, is_local, element_size, v_colmajor, paged_kv_non_TMA, softcap, false);
+        return {64, std::get<1>(stock), std::get<2>(stock), std::get<3>(stock)};
+    }
     if (element_size == 2) {
         if (headdim <= 64) {
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};
